@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import sqlite3
 import time
@@ -295,13 +296,19 @@ def parse_config() -> dict:
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env")
 
+    soft_mode = os.getenv("SOFT_MODE", "true").strip().lower() in {"1", "true", "yes"}
+    min_interval = 600 if soft_mode else 30
+
     cfg = {
         "token": token,
         "db_path": os.getenv("STATE_DB_PATH", "state.sqlite3").strip(),
-        "default_interval": max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "120"))),
+        "default_interval": max(min_interval, int(os.getenv("POLL_INTERVAL_SECONDS", "120"))),
         "max_notifications": max(1, int(os.getenv("MAX_NOTIFICATIONS_PER_CYCLE", "10"))),
         "admin_chat_id": os.getenv("ADMIN_CHAT_ID", "").strip() or None,
         "default_region": os.getenv("AVITO_REGION", "rossiya").strip(),
+        "soft_mode": soft_mode,
+        "min_interval": min_interval,
+        "jitter_seconds": max(0, int(os.getenv("SOFT_JITTER_SECONDS", "180"))),
     }
     return cfg
 
@@ -425,12 +432,12 @@ def is_authorized(chat_id: str, store: StateStore, env_admin_chat_id: Optional[s
 
 
 def get_runtime_settings(
-    store: StateStore, default_interval: int, default_region: str
+    store: StateStore, default_interval: int, default_region: str, min_interval: int
 ) -> Tuple[bool, Optional[str], int, str, Optional[int]]:
     enabled = store.get_setting("enabled", "0") == "1"
     query = store.get_setting("query", None)
     interval = int(store.get_setting("interval", str(default_interval)) or default_interval)
-    interval = max(30, interval)
+    interval = max(min_interval, interval)
     region = store.get_setting("region", default_region) or default_region
     if region == "respublika_dagestan":
         region = "dagestan"
@@ -446,11 +453,12 @@ def set_runtime_settings(
     interval: int,
     region: Optional[str] = None,
     max_price: Optional[int] = None,
+    min_interval: int = 30,
 ) -> None:
     store.set_setting("enabled", "1" if enabled else "0")
     if query is not None:
         store.set_setting("query", query)
-    store.set_setting("interval", str(max(30, interval)))
+    store.set_setting("interval", str(max(min_interval, interval)))
     if region is not None:
         store.set_setting("region", region)
     store.set_setting("max_price", str(max_price) if max_price else "")
@@ -469,7 +477,10 @@ def handle_command(
     if not clean:
         return
 
-    enabled, query, interval, region, max_price = get_runtime_settings(store, default_interval, default_region)
+    min_interval = 600 if default_interval >= 600 else 30
+    enabled, query, interval, region, max_price = get_runtime_settings(
+        store, default_interval, default_region, min_interval
+    )
 
     if clean.startswith("/start"):
         tg.send_message(chat_id, "Бот готов к работе.\n" + HELP_TEXT)
@@ -480,7 +491,9 @@ def handle_command(
         return
 
     if clean.startswith("/stop"):
-        set_runtime_settings(store, False, query, interval, region=region, max_price=max_price)
+        set_runtime_settings(
+            store, False, query, interval, region=region, max_price=max_price, min_interval=min_interval
+        )
         tg.send_message(chat_id, "Мониторинг остановлен.")
         return
 
@@ -505,10 +518,12 @@ def handle_command(
     if clean.startswith("/interval"):
         parts = clean.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].isdigit():
-            tg.send_message(chat_id, "Используй: /interval 120")
+            tg.send_message(chat_id, f"Используй: /interval {max(120, min_interval)}")
             return
-        new_interval = max(30, int(parts[1]))
-        set_runtime_settings(store, enabled, query, new_interval, region=region, max_price=max_price)
+        new_interval = max(min_interval, int(parts[1]))
+        set_runtime_settings(
+            store, enabled, query, new_interval, region=region, max_price=max_price, min_interval=min_interval
+        )
         tg.send_message(chat_id, f"Интервал обновлен: {new_interval} сек")
         return
 
@@ -528,6 +543,7 @@ def handle_command(
             interval,
             region=parsed_region,
             max_price=parsed_max_price,
+            min_interval=min_interval,
         )
         price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
         tg.send_message(
@@ -549,6 +565,7 @@ def handle_command(
         interval,
         region=parsed_region,
         max_price=parsed_max_price,
+        min_interval=min_interval,
     )
     price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
     tg.send_message(
@@ -595,8 +612,11 @@ def run_monitor_cycle(
     max_notifications: int,
     default_interval: int,
     default_region: str,
+    min_interval: int,
 ) -> None:
-    enabled, query, _interval, region, max_price = get_runtime_settings(store, default_interval, default_region)
+    enabled, query, _interval, region, max_price = get_runtime_settings(
+        store, default_interval, default_region, min_interval
+    )
     if not enabled or not query:
         return
 
@@ -659,7 +679,7 @@ def main() -> None:
             )
 
             enabled, query, interval, _region, _max_price = get_runtime_settings(
-                store, cfg["default_interval"], cfg["default_region"]
+                store, cfg["default_interval"], cfg["default_region"], cfg["min_interval"]
             )
             now = time.time()
             if enabled and query and now >= next_check_ts:
@@ -671,13 +691,15 @@ def main() -> None:
                         max_notifications=cfg["max_notifications"],
                         default_interval=cfg["default_interval"],
                         default_region=cfg["default_region"],
+                        min_interval=cfg["min_interval"],
                     )
-                    next_check_ts = now + interval
+                    jitter = random.randint(0, cfg["jitter_seconds"]) if cfg["soft_mode"] else 0
+                    next_check_ts = now + interval + jitter
                 except requests.HTTPError as http_exc:
                     code = http_exc.response.status_code if http_exc.response is not None else None
                     admin_chat_id = store.get_setting("admin_chat_id")
                     if code == 429:
-                        next_check_ts = now + max(interval * 5, 900)
+                        next_check_ts = now + max(interval * 6, 1800)
                         last_notice_ts = int(store.get_setting("last_rate_limit_notice_ts", "0") or "0")
                         if admin_chat_id and (time.time() - last_notice_ts > 3600):
                             tg.send_message(
@@ -687,10 +709,10 @@ def main() -> None:
                             )
                             store.set_setting("last_rate_limit_notice_ts", str(int(time.time())))
                     else:
-                        next_check_ts = now + max(interval * 2, 300)
+                        next_check_ts = now + max(interval * 2, 600)
                     print(f"[error] HTTPError: {http_exc}")
             elif not enabled:
-                next_check_ts = now + 5
+                next_check_ts = now + 10
 
         except Exception as exc:
             print(f"[error] {type(exc).__name__}: {exc}")
