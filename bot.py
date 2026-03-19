@@ -24,6 +24,30 @@ class Listing:
     url: str
 
 
+REGION_ALIASES = {
+    "дагестане": "respublika_dagestan",
+    "дагестан": "respublika_dagestan",
+    "республике дагестан": "respublika_dagestan",
+    "республика дагестан": "respublika_dagestan",
+    "москве": "moskva",
+    "москва": "moskva",
+    "спб": "sankt-peterburg",
+    "питере": "sankt-peterburg",
+    "петербурге": "sankt-peterburg",
+    "санкт-петербург": "sankt-peterburg",
+    "санкт петербург": "sankt-peterburg",
+    "россии": "rossiya",
+    "россия": "rossiya",
+}
+
+REGION_LABELS = {
+    "respublika_dagestan": "Дагестан",
+    "moskva": "Москва",
+    "sankt-peterburg": "Санкт-Петербург",
+    "rossiya": "Россия",
+}
+
+
 class StateStore:
     def __init__(self, db_path: str) -> None:
         self.conn = sqlite3.connect(db_path)
@@ -121,15 +145,15 @@ class StateStore:
 class AvitoMonitor:
     ITEM_ID_RE = re.compile(r"_(\d+)(?:$|\?|#)")
 
-    def __init__(self, region: str = "rossiya") -> None:
-        self.region = region
-
-    def build_search_url(self, query: str) -> str:
+    def build_search_url(self, query: str, region: str, max_price: Optional[int] = None) -> str:
         encoded_query = quote_plus(query)
-        return f"{AVITO_BASE}/{self.region}?q={encoded_query}&s=104"
+        url = f"{AVITO_BASE}/{region}?q={encoded_query}&s=104"
+        if max_price:
+            url += f"&pmax={max_price}"
+        return url
 
-    def fetch(self, query: str) -> Tuple[str, List[Listing]]:
-        search_url = self.build_search_url(query)
+    def fetch(self, query: str, region: str, max_price: Optional[int] = None) -> Tuple[str, List[Listing]]:
+        search_url = self.build_search_url(query, region, max_price)
         headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "ru-RU,ru;q=0.9"}
         response = requests.get(search_url, headers=headers, timeout=20)
         response.raise_for_status()
@@ -201,13 +225,13 @@ class TelegramClient:
 
 
 HELP_TEXT = (
+    "Пиши обычным текстом:\n"
+    "Пример: найди мне playstation 5 slim за 36000 рублей в дагестане\n\n"
     "Команды:\n"
-    "/track <запрос> - начать отслеживать запрос\n"
     "/stop - остановить мониторинг\n"
     "/status - показать текущие настройки\n"
     "/interval <сек> - сменить интервал проверки (минимум 30)\n"
-    "/help - показать помощь\n\n"
-    "Пример: /track iphone 13 128"
+    "/help - показать помощь"
 )
 
 
@@ -223,13 +247,80 @@ def parse_config() -> dict:
         "default_interval": max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "120"))),
         "max_notifications": max(1, int(os.getenv("MAX_NOTIFICATIONS_PER_CYCLE", "10"))),
         "admin_chat_id": os.getenv("ADMIN_CHAT_ID", "").strip() or None,
-        "region": os.getenv("AVITO_REGION", "rossiya").strip(),
+        "default_region": os.getenv("AVITO_REGION", "rossiya").strip(),
     }
     return cfg
 
 
 def normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
+
+
+def parse_price(text: str) -> Optional[int]:
+    compact = text.lower().replace("\xa0", " ")
+    price_patterns = [
+        r"(?:до|не\s+дороже|не\s+выше|максимум|до\s+цены)\s*(\d[\d\s]{2,})",
+        r"(?:за|около|примерно)\s*(\d[\d\s]{2,})\s*(?:₽|р|руб|руб\.|рублей|рубля)?",
+        r"(\d[\d\s]{2,})\s*(?:₽|р|руб|руб\.|рублей|рубля)",
+    ]
+
+    for pattern in price_patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if not match:
+            continue
+        digits = re.sub(r"[^\d]", "", match.group(1))
+        if digits:
+            return int(digits)
+
+    k_match = re.search(r"(\d{2,3})\s*[кk]\b", compact)
+    if k_match:
+        return int(k_match.group(1)) * 1000
+
+    return None
+
+
+def parse_region(text: str, default_region: str) -> Tuple[str, str]:
+    lowered = text.lower()
+    for alias in sorted(REGION_ALIASES, key=len, reverse=True):
+        if alias in lowered:
+            slug = REGION_ALIASES[alias]
+            return slug, REGION_LABELS.get(slug, slug)
+    return default_region, REGION_LABELS.get(default_region, default_region)
+
+
+def build_search_query(text: str) -> str:
+    cleaned = text.lower()
+    cleaned = re.sub(r"^(найди(?:\s+мне)?|ищу|хочу|нужен|нужна|нужно)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(именно|пожалуйста|желательно|в\s+регионе|в\s+городе)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b(дагестане|дагестан|республике\s+дагестан|республика\s+дагестан)\b", " ", cleaned)
+    cleaned = re.sub(r"\b(москве|москва|спб|питере|петербурге|санкт[- ]петербург|россии|россия)\b", " ", cleaned)
+    cleaned = re.sub(
+        r"(?:до|не\s+дороже|не\s+выше|максимум|за|около|примерно)\s*\d[\d\s]*(?:₽|р|руб|руб\.|рублей|рубля)?",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\d[\d\s]*(?:₽|р|руб|руб\.|рублей|рубля)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = normalize_text(cleaned)
+    return cleaned
+
+
+def parse_human_request(text: str, default_region: str) -> Tuple[str, str, str, Optional[int]]:
+    region_slug, region_label = parse_region(text, default_region)
+    max_price = parse_price(text)
+    query = build_search_query(text)
+    if not query:
+        query = normalize_text(text)
+    return query, region_slug, region_label, max_price
+
+
+def tracking_key(query: str, region: str, max_price: Optional[int]) -> str:
+    return f"{region}|{max_price or 0}|{query.lower()}"
 
 
 def is_authorized(chat_id: str, store: StateStore, env_admin_chat_id: Optional[str]) -> bool:
@@ -245,19 +336,34 @@ def is_authorized(chat_id: str, store: StateStore, env_admin_chat_id: Optional[s
     return True
 
 
-def get_runtime_settings(store: StateStore, default_interval: int) -> Tuple[bool, Optional[str], int]:
+def get_runtime_settings(
+    store: StateStore, default_interval: int, default_region: str
+) -> Tuple[bool, Optional[str], int, str, Optional[int]]:
     enabled = store.get_setting("enabled", "0") == "1"
     query = store.get_setting("query", None)
     interval = int(store.get_setting("interval", str(default_interval)) or default_interval)
     interval = max(30, interval)
-    return enabled, query, interval
+    region = store.get_setting("region", default_region) or default_region
+    max_price_raw = store.get_setting("max_price", "")
+    max_price = int(max_price_raw) if max_price_raw and max_price_raw.isdigit() else None
+    return enabled, query, interval, region, max_price
 
 
-def set_runtime_settings(store: StateStore, enabled: bool, query: Optional[str], interval: int) -> None:
+def set_runtime_settings(
+    store: StateStore,
+    enabled: bool,
+    query: Optional[str],
+    interval: int,
+    region: Optional[str] = None,
+    max_price: Optional[int] = None,
+) -> None:
     store.set_setting("enabled", "1" if enabled else "0")
     if query is not None:
         store.set_setting("query", query)
     store.set_setting("interval", str(max(30, interval)))
+    if region is not None:
+        store.set_setting("region", region)
+    store.set_setting("max_price", str(max_price) if max_price else "")
 
 
 def handle_command(
@@ -266,13 +372,14 @@ def handle_command(
     tg: TelegramClient,
     store: StateStore,
     default_interval: int,
+    default_region: str,
     monitor: AvitoMonitor,
 ) -> None:
     clean = normalize_text(text)
     if not clean:
         return
 
-    enabled, query, interval = get_runtime_settings(store, default_interval)
+    enabled, query, interval, region, max_price = get_runtime_settings(store, default_interval, default_region)
 
     if clean.startswith("/start"):
         tg.send_message(chat_id, "Бот готов к работе.\\n" + HELP_TEXT)
@@ -283,16 +390,20 @@ def handle_command(
         return
 
     if clean.startswith("/stop"):
-        set_runtime_settings(store, False, query, interval)
+        set_runtime_settings(store, False, query, interval, region=region, max_price=max_price)
         tg.send_message(chat_id, "Мониторинг остановлен.")
         return
 
     if clean.startswith("/status"):
         if query:
-            url = monitor.build_search_url(query)
+            url = monitor.build_search_url(query, region, max_price)
+            region_label = REGION_LABELS.get(region, region)
+            price_line = f"\nЦена до: {max_price} ₽" if max_price else ""
             msg = (
                 f"Статус: {'включен' if enabled else 'выключен'}\\n"
                 f"Запрос: {query}\\n"
+                f"Регион: {region_label}"
+                f"{price_line}\\n"
                 f"Интервал: {interval} сек\\n"
                 f"URL: {url}"
             )
@@ -307,33 +418,55 @@ def handle_command(
             tg.send_message(chat_id, "Используй: /interval 120")
             return
         new_interval = max(30, int(parts[1]))
-        set_runtime_settings(store, enabled, query, new_interval)
+        set_runtime_settings(store, enabled, query, new_interval, region=region, max_price=max_price)
         tg.send_message(chat_id, f"Интервал обновлен: {new_interval} сек")
         return
 
     if clean.startswith("/track"):
         parts = clean.split(maxsplit=1)
-        if len(parts) != 2:
-            tg.send_message(chat_id, "Используй: /track iphone 13")
+        if len(parts) != 2 or not normalize_text(parts[1]):
+            tg.send_message(chat_id, "Пример: /track playstation 5 slim за 36000 в дагестане")
             return
 
-        new_query = normalize_text(parts[1])
-        set_runtime_settings(store, True, new_query, interval)
+        parsed_query, parsed_region, parsed_region_label, parsed_max_price = parse_human_request(
+            parts[1], default_region
+        )
+        set_runtime_settings(
+            store,
+            True,
+            parsed_query,
+            interval,
+            region=parsed_region,
+            max_price=parsed_max_price,
+        )
+        price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
         tg.send_message(
             chat_id,
-            "Запрос сохранен. Мониторинг включен.\\n"
-            f"Запрос: {new_query}\\n"
-            f"URL: {monitor.build_search_url(new_query)}",
+            "Ок, включил мониторинг.\\n"
+            f"Запрос: {parsed_query}\\n"
+            f"Регион: {parsed_region_label}"
+            f"{price_line}\\n"
+            f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
         )
         return
 
-    # Если пользователь пишет просто текст без команды, считаем это новым запросом
-    set_runtime_settings(store, True, clean, interval)
+    parsed_query, parsed_region, parsed_region_label, parsed_max_price = parse_human_request(clean, default_region)
+    set_runtime_settings(
+        store,
+        True,
+        parsed_query,
+        interval,
+        region=parsed_region,
+        max_price=parsed_max_price,
+    )
+    price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
     tg.send_message(
         chat_id,
-        "Принял как поисковый запрос и включил мониторинг.\\n"
-        f"Запрос: {clean}\\n"
-        f"URL: {monitor.build_search_url(clean)}",
+        "Ок, ищу.\\n"
+        f"Запрос: {parsed_query}\\n"
+        f"Регион: {parsed_region_label}"
+        f"{price_line}\\n"
+        f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
     )
 
 
@@ -342,6 +475,7 @@ def process_updates(
     store: StateStore,
     env_admin_chat_id: Optional[str],
     default_interval: int,
+    default_region: str,
     monitor: AvitoMonitor,
 ) -> None:
     offset = int(store.get_setting("tg_offset", "0") or "0")
@@ -355,7 +489,7 @@ def process_updates(
         text = message.get("text", "")
 
         if chat_id and text and is_authorized(chat_id, store, env_admin_chat_id):
-            handle_command(text, chat_id, tg, store, default_interval, monitor)
+            handle_command(text, chat_id, tg, store, default_interval, default_region, monitor)
 
         offset = max(offset, update_id + 1)
 
@@ -368,8 +502,9 @@ def run_monitor_cycle(
     monitor: AvitoMonitor,
     max_notifications: int,
     default_interval: int,
+    default_region: str,
 ) -> None:
-    enabled, query, _interval = get_runtime_settings(store, default_interval)
+    enabled, query, _interval, region, max_price = get_runtime_settings(store, default_interval, default_region)
     if not enabled or not query:
         return
 
@@ -377,17 +512,24 @@ def run_monitor_cycle(
     if not admin_chat_id:
         return
 
-    search_url, listings = monitor.fetch(query)
-    new_items = [item for item in listings if not store.is_seen(query, item.item_id)]
+    search_key = tracking_key(query, region, max_price)
+    search_url, listings = monitor.fetch(query, region, max_price)
+    new_items = [item for item in listings if not store.is_seen(search_key, item.item_id)]
 
-    if not store.is_query_bootstrapped(query):
+    if not store.is_query_bootstrapped(search_key):
         for item in new_items:
-            store.mark_seen(query, item)
-        store.mark_query_bootstrapped(query)
+            store.mark_seen(search_key, item)
+        store.mark_query_bootstrapped(search_key)
+        region_label = REGION_LABELS.get(region, region)
+        price_line = f"\nЦена до: {max_price} ₽" if max_price else ""
         tg.send_message(
             admin_chat_id,
             f"Мониторинг активен. Базово сохранено {len(new_items)} текущих объявлений.\\n"
-            f"Дальше будут приходить только новые.\\n{search_url}",
+            f"Дальше будут приходить только новые.\\n"
+            f"Запрос: {query}\\n"
+            f"Регион: {region_label}"
+            f"{price_line}\\n"
+            f"{search_url}",
         )
         return
 
@@ -399,7 +541,7 @@ def run_monitor_cycle(
                 f"Найдено новое объявление:\\n{item.title}\\n{item.url}",
             )
             notified += 1
-        store.mark_seen(query, item)
+        store.mark_seen(search_key, item)
 
     if notified > 0:
         tg.send_message(admin_chat_id, f"Новых объявлений: {len(new_items)}, отправлено: {notified}")
@@ -409,7 +551,7 @@ def main() -> None:
     cfg = parse_config()
     store = StateStore(cfg["db_path"])
     tg = TelegramClient(cfg["token"])
-    monitor = AvitoMonitor(region=cfg["region"])
+    monitor = AvitoMonitor()
 
     print("Bot started")
     print("Waiting for Telegram commands...")
@@ -423,10 +565,13 @@ def main() -> None:
                 store=store,
                 env_admin_chat_id=cfg["admin_chat_id"],
                 default_interval=cfg["default_interval"],
+                default_region=cfg["default_region"],
                 monitor=monitor,
             )
 
-            enabled, query, interval = get_runtime_settings(store, cfg["default_interval"])
+            enabled, query, interval, _region, _max_price = get_runtime_settings(
+                store, cfg["default_interval"], cfg["default_region"]
+            )
             now = time.time()
             if enabled and query and now >= next_check_ts:
                 run_monitor_cycle(
@@ -435,6 +580,7 @@ def main() -> None:
                     monitor=monitor,
                     max_notifications=cfg["max_notifications"],
                     default_interval=cfg["default_interval"],
+                    default_region=cfg["default_region"],
                 )
                 next_check_ts = now + interval
             elif not enabled:
