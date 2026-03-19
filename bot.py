@@ -22,6 +22,7 @@ class Listing:
     item_id: str
     title: str
     url: str
+    image_url: Optional[str] = None
 
 
 REGION_ALIASES = {
@@ -164,7 +165,8 @@ class AvitoMonitor:
         for a in soup.select("a[data-marker='item-title']"):
             href = (a.get("href") or "").strip()
             title = " ".join(a.get_text(" ", strip=True).split())
-            candidates.append((href, title))
+            image_url = self._extract_image_url(a)
+            candidates.append((href, title, image_url))
 
         if not candidates:
             for a in soup.find_all("a", href=True):
@@ -172,12 +174,13 @@ class AvitoMonitor:
                 title = " ".join(a.get_text(" ", strip=True).split())
                 if "/" not in href:
                     continue
-                candidates.append((href, title))
+                image_url = self._extract_image_url(a)
+                candidates.append((href, title, image_url))
 
         listings: List[Listing] = []
         seen_ids = set()
 
-        for href, title in candidates:
+        for href, title, image_url in candidates:
             full_url = href if href.startswith("http") else urljoin(AVITO_BASE, href)
             if "avito.ru" not in full_url:
                 continue
@@ -194,9 +197,33 @@ class AvitoMonitor:
             if not title:
                 title = "Новое объявление"
 
-            listings.append(Listing(item_id=item_id, title=title, url=full_url))
+            listings.append(Listing(item_id=item_id, title=title, url=full_url, image_url=image_url))
 
         return search_url, listings
+
+    @staticmethod
+    def _extract_image_url(link_tag) -> Optional[str]:
+        parent = link_tag.parent
+        grandparent = parent.parent if parent else None
+        for node in (link_tag, parent, grandparent):
+            if node is None:
+                continue
+            img = node.find("img")
+            if not img:
+                continue
+            for attr in ("src", "data-src", "srcset", "data-srcset"):
+                raw = (img.get(attr) or "").strip()
+                if not raw:
+                    continue
+                if attr in ("srcset", "data-srcset"):
+                    raw = raw.split(",")[0].strip().split(" ")[0].strip()
+                if raw.startswith("//"):
+                    raw = "https:" + raw
+                elif raw.startswith("/"):
+                    raw = urljoin(AVITO_BASE, raw)
+                if raw.startswith("http"):
+                    return raw
+        return None
 
 
 class TelegramClient:
@@ -222,6 +249,33 @@ class TelegramClient:
             timeout=20,
         )
         resp.raise_for_status()
+
+    def send_link_card(self, chat_id: str, title: str, url: str) -> None:
+        payload = {
+            "chat_id": chat_id,
+            "text": title,
+            "disable_web_page_preview": True,
+            "reply_markup": {
+                "inline_keyboard": [[{"text": "Открыть на Avito", "url": url}]],
+            },
+        }
+        resp = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=20)
+        resp.raise_for_status()
+
+    def send_photo_card(self, chat_id: str, listing: Listing) -> None:
+        if listing.image_url:
+            payload = {
+                "chat_id": chat_id,
+                "photo": listing.image_url,
+                "caption": listing.title,
+                "reply_markup": {
+                    "inline_keyboard": [[{"text": "Открыть на Avito", "url": listing.url}]],
+                },
+            }
+            resp = requests.post(f"{self.base_url}/sendPhoto", json=payload, timeout=25)
+            if resp.ok:
+                return
+        self.send_link_card(chat_id, listing.title, listing.url)
 
 
 HELP_TEXT = (
@@ -382,7 +436,7 @@ def handle_command(
     enabled, query, interval, region, max_price = get_runtime_settings(store, default_interval, default_region)
 
     if clean.startswith("/start"):
-        tg.send_message(chat_id, "Бот готов к работе.\\n" + HELP_TEXT)
+        tg.send_message(chat_id, "Бот готов к работе.\n" + HELP_TEXT)
         return
 
     if clean.startswith("/help"):
@@ -400,15 +454,15 @@ def handle_command(
             region_label = REGION_LABELS.get(region, region)
             price_line = f"\nЦена до: {max_price} ₽" if max_price else ""
             msg = (
-                f"Статус: {'включен' if enabled else 'выключен'}\\n"
-                f"Запрос: {query}\\n"
+                f"Статус: {'включен' if enabled else 'выключен'}\n"
+                f"Запрос: {query}\n"
                 f"Регион: {region_label}"
-                f"{price_line}\\n"
-                f"Интервал: {interval} сек\\n"
+                f"{price_line}\n"
+                f"Интервал: {interval} сек\n"
                 f"URL: {url}"
             )
         else:
-            msg = f"Статус: {'включен' if enabled else 'выключен'}\\nЗапрос еще не задан."
+            msg = f"Статус: {'включен' if enabled else 'выключен'}\nЗапрос еще не задан."
         tg.send_message(chat_id, msg)
         return
 
@@ -442,10 +496,10 @@ def handle_command(
         price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
         tg.send_message(
             chat_id,
-            "Ок, включил мониторинг.\\n"
-            f"Запрос: {parsed_query}\\n"
+            "Ок, включил мониторинг.\n"
+            f"Запрос: {parsed_query}\n"
             f"Регион: {parsed_region_label}"
-            f"{price_line}\\n"
+            f"{price_line}\n"
             f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
         )
         return
@@ -462,10 +516,10 @@ def handle_command(
     price_line = f"\nЦена до: {parsed_max_price} ₽" if parsed_max_price else ""
     tg.send_message(
         chat_id,
-        "Ок, ищу.\\n"
-        f"Запрос: {parsed_query}\\n"
+        "Ок, ищу.\n"
+        f"Запрос: {parsed_query}\n"
         f"Регион: {parsed_region_label}"
-        f"{price_line}\\n"
+        f"{price_line}\n"
         f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
     )
 
@@ -524,11 +578,11 @@ def run_monitor_cycle(
         price_line = f"\nЦена до: {max_price} ₽" if max_price else ""
         tg.send_message(
             admin_chat_id,
-            f"Мониторинг активен. Базово сохранено {len(new_items)} текущих объявлений.\\n"
-            f"Дальше будут приходить только новые.\\n"
-            f"Запрос: {query}\\n"
+            f"Мониторинг активен. Базово сохранено {len(new_items)} текущих объявлений.\n"
+            f"Дальше будут приходить только новые.\n"
+            f"Запрос: {query}\n"
             f"Регион: {region_label}"
-            f"{price_line}\\n"
+            f"{price_line}\n"
             f"{search_url}",
         )
         return
@@ -536,10 +590,7 @@ def run_monitor_cycle(
     notified = 0
     for item in new_items:
         if notified < max_notifications:
-            tg.send_message(
-                admin_chat_id,
-                f"Найдено новое объявление:\\n{item.title}\\n{item.url}",
-            )
+            tg.send_photo_card(admin_chat_id, item)
             notified += 1
         store.mark_seen(search_key, item)
 
