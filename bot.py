@@ -381,6 +381,28 @@ def tracking_key(query: str, region: str, max_price: Optional[int]) -> str:
     return f"{region}|{max_price or 0}|{query.lower()}"
 
 
+def send_initial_preview(
+    tg: TelegramClient,
+    chat_id: str,
+    monitor: AvitoMonitor,
+    query: str,
+    region: str,
+    max_price: Optional[int],
+) -> None:
+    try:
+        _url, listings = monitor.fetch(query, region, max_price)
+    except Exception:
+        return
+
+    if not listings:
+        tg.send_message(chat_id, "Пока не вижу объявлений по этому запросу.")
+        return
+
+    tg.send_message(chat_id, f"Сейчас на Avito есть {len(listings)} объявлений. Показываю первые 3:")
+    for item in listings[:3]:
+        tg.send_photo_card(chat_id, item)
+
+
 def is_authorized(chat_id: str, store: StateStore, env_admin_chat_id: Optional[str]) -> bool:
     if env_admin_chat_id:
         return chat_id == env_admin_chat_id
@@ -508,6 +530,7 @@ def handle_command(
             f"{price_line}\n"
             f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
         )
+        send_initial_preview(tg, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
         return
 
     parsed_query, parsed_region, parsed_region_label, parsed_max_price = parse_human_request(clean, default_region)
@@ -528,6 +551,7 @@ def handle_command(
         f"{price_line}\n"
         f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
     )
+    send_initial_preview(tg, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
 
 
 def process_updates(
