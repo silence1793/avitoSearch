@@ -361,7 +361,11 @@ def build_search_query(text: str) -> str:
     )
     cleaned = re.sub(r"\d[\d\s]*(?:₽|р|руб|руб\.|рублей|рубля)\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = normalize_text(cleaned)
-    return cleaned
+
+    # Remove leftover prepositions/particles after stripping region/price fragments.
+    stop_tokens = {"в", "на", "по", "с", "со", "из", "для", "к", "у", "и", "а"}
+    tokens = [tok for tok in cleaned.split(" ") if tok and tok not in stop_tokens]
+    return " ".join(tokens)
 
 
 def parse_human_request(text: str, default_region: str) -> Tuple[str, str, str, Optional[int]]:
