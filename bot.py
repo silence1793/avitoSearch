@@ -391,7 +391,15 @@ def send_initial_preview(
 ) -> None:
     try:
         _url, listings = monitor.fetch(query, region, max_price)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            tg.send_message(chat_id, "Avito временно ограничил запросы (429). Повторю позже автоматически.")
+        else:
+            tg.send_message(chat_id, "Не удалось получить объявления с Avito прямо сейчас. Повторю позже.")
+        return
     except Exception:
+        tg.send_message(chat_id, "Не удалось получить объявления с Avito прямо сейчас. Повторю позже.")
         return
 
     if not listings:
@@ -655,15 +663,32 @@ def main() -> None:
             )
             now = time.time()
             if enabled and query and now >= next_check_ts:
-                run_monitor_cycle(
-                    tg=tg,
-                    store=store,
-                    monitor=monitor,
-                    max_notifications=cfg["max_notifications"],
-                    default_interval=cfg["default_interval"],
-                    default_region=cfg["default_region"],
-                )
-                next_check_ts = now + interval
+                try:
+                    run_monitor_cycle(
+                        tg=tg,
+                        store=store,
+                        monitor=monitor,
+                        max_notifications=cfg["max_notifications"],
+                        default_interval=cfg["default_interval"],
+                        default_region=cfg["default_region"],
+                    )
+                    next_check_ts = now + interval
+                except requests.HTTPError as http_exc:
+                    code = http_exc.response.status_code if http_exc.response is not None else None
+                    admin_chat_id = store.get_setting("admin_chat_id")
+                    if code == 429:
+                        next_check_ts = now + max(interval * 5, 900)
+                        last_notice_ts = int(store.get_setting("last_rate_limit_notice_ts", "0") or "0")
+                        if admin_chat_id and (time.time() - last_notice_ts > 3600):
+                            tg.send_message(
+                                admin_chat_id,
+                                "Avito временно ограничил запросы (429). "
+                                "Я включил паузу и попробую снова позже.",
+                            )
+                            store.set_setting("last_rate_limit_notice_ts", str(int(time.time())))
+                    else:
+                        next_check_ts = now + max(interval * 2, 300)
+                    print(f"[error] HTTPError: {http_exc}")
             elif not enabled:
                 next_check_ts = now + 5
 
