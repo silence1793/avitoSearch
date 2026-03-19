@@ -26,10 +26,10 @@ class Listing:
 
 
 REGION_ALIASES = {
-    "дагестане": "respublika_dagestan",
-    "дагестан": "respublika_dagestan",
-    "республике дагестан": "respublika_dagestan",
-    "республика дагестан": "respublika_dagestan",
+    "дагестане": "dagestan",
+    "дагестан": "dagestan",
+    "республике дагестан": "dagestan",
+    "республика дагестан": "dagestan",
     "москве": "moskva",
     "москва": "moskva",
     "спб": "sankt-peterburg",
@@ -42,7 +42,7 @@ REGION_ALIASES = {
 }
 
 REGION_LABELS = {
-    "respublika_dagestan": "Дагестан",
+    "dagestan": "Дагестан",
     "moskva": "Москва",
     "sankt-peterburg": "Санкт-Петербург",
     "rossiya": "Россия",
@@ -402,6 +402,8 @@ def get_runtime_settings(
     interval = int(store.get_setting("interval", str(default_interval)) or default_interval)
     interval = max(30, interval)
     region = store.get_setting("region", default_region) or default_region
+    if region == "respublika_dagestan":
+        region = "dagestan"
     max_price_raw = store.get_setting("max_price", "")
     max_price = int(max_price_raw) if max_price_raw and max_price_raw.isdigit() else None
     return enabled, query, interval, region, max_price
