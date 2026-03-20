@@ -388,19 +388,45 @@ def tracking_key(query: str, region: str, max_price: Optional[int]) -> str:
     return f"{region}|{max_price or 0}|{query.lower()}"
 
 
+def get_rate_limit_until_ts(store: StateStore) -> int:
+    return int(store.get_setting("rate_limited_until_ts", "0") or "0")
+
+
+def set_rate_limit_until_ts(store: StateStore, ts: int) -> None:
+    store.set_setting("rate_limited_until_ts", str(max(0, ts)))
+
+
+def calc_retry_after_seconds(http_exc: requests.HTTPError, fallback_seconds: int) -> int:
+    if http_exc.response is not None:
+        header = http_exc.response.headers.get("Retry-After", "").strip()
+        if header.isdigit():
+            return max(60, int(header))
+    return fallback_seconds
+
+
 def send_initial_preview(
     tg: TelegramClient,
+    store: StateStore,
     chat_id: str,
     monitor: AvitoMonitor,
     query: str,
     region: str,
     max_price: Optional[int],
 ) -> None:
+    now_ts = int(time.time())
+    rate_limited_until = get_rate_limit_until_ts(store)
+    if now_ts < rate_limited_until:
+        wait_min = max(1, (rate_limited_until - now_ts) // 60)
+        tg.send_message(chat_id, f"Avito ограничил запросы. Попробую снова примерно через {wait_min} мин.")
+        return
+
     try:
         _url, listings = monitor.fetch(query, region, max_price)
     except requests.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
         if status_code == 429:
+            retry_after = calc_retry_after_seconds(exc, fallback_seconds=3600)
+            set_rate_limit_until_ts(store, int(time.time()) + retry_after)
             tg.send_message(chat_id, "Avito временно ограничил запросы (429). Повторю позже автоматически.")
         else:
             tg.send_message(chat_id, "Не удалось получить объявления с Avito прямо сейчас. Повторю позже.")
@@ -554,7 +580,7 @@ def handle_command(
             f"{price_line}\n"
             f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
         )
-        send_initial_preview(tg, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
+        send_initial_preview(tg, store, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
         return
 
     parsed_query, parsed_region, parsed_region_label, parsed_max_price = parse_human_request(clean, default_region)
@@ -576,7 +602,7 @@ def handle_command(
         f"{price_line}\n"
         f"Ссылка: {monitor.build_search_url(parsed_query, parsed_region, parsed_max_price)}",
     )
-    send_initial_preview(tg, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
+    send_initial_preview(tg, store, chat_id, monitor, parsed_query, parsed_region, parsed_max_price)
 
 
 def process_updates(
@@ -682,7 +708,12 @@ def main() -> None:
                 store, cfg["default_interval"], cfg["default_region"], cfg["min_interval"]
             )
             now = time.time()
+            rate_limited_until = get_rate_limit_until_ts(store)
+
             if enabled and query and now >= next_check_ts:
+                if int(now) < rate_limited_until:
+                    next_check_ts = max(float(rate_limited_until), now + 60)
+                    continue
                 try:
                     run_monitor_cycle(
                         tg=tg,
@@ -699,7 +730,10 @@ def main() -> None:
                     code = http_exc.response.status_code if http_exc.response is not None else None
                     admin_chat_id = store.get_setting("admin_chat_id")
                     if code == 429:
-                        next_check_ts = now + max(interval * 6, 1800)
+                        retry_after = calc_retry_after_seconds(http_exc, fallback_seconds=max(interval * 6, 1800))
+                        until_ts = int(now) + retry_after
+                        set_rate_limit_until_ts(store, until_ts)
+                        next_check_ts = float(until_ts)
                         last_notice_ts = int(store.get_setting("last_rate_limit_notice_ts", "0") or "0")
                         if admin_chat_id and (time.time() - last_notice_ts > 3600):
                             tg.send_message(
