@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from src.db import Store
 
 HELP_TEXT = (
-    "Личный ассистент: покупки, фокус, финансы, контент.\n\n"
+    "Планировщик: покупки, фокус, финансы, контент.\n\n"
     "Быстрый старт:\n"
     "1) Покупки: /wish add наушники | 12000\n"
     "2) Фокус: /focus set задача1 ; задача2 ; задача3\n"
@@ -47,7 +47,7 @@ def _focus_day_key(tz_name: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Бот запущен.\n\n" + HELP_TEXT)
+    await update.message.reply_text("Планировщик запущен.\n\n" + HELP_TEXT)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
