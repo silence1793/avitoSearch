@@ -5,8 +5,15 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from src.db import Store
 
@@ -25,6 +32,43 @@ HELP_TEXT = (
     "/idea ... и /draft ... - контент\n"
     "/help - помощь"
 )
+
+MAIN_MENU_ROWS = [
+    ["🛒 Покупки", "🎯 Фокус"],
+    ["💸 Финансы", "✍️ Контент"],
+    ["📥 Inbox", "ℹ️ Помощь"],
+]
+
+MENU_BUTTONS = {item for row in MAIN_MENU_ROWS for item in row}
+
+
+def _main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(MAIN_MENU_ROWS, resize_keyboard=True)
+
+
+def _section_actions(section: str) -> InlineKeyboardMarkup:
+    mapping = {
+        "wish": [
+            [InlineKeyboardButton("Показать wishlist", callback_data="wish:list")],
+            [InlineKeyboardButton("Как добавить", callback_data="wish:add_help")],
+        ],
+        "focus": [
+            [InlineKeyboardButton("Фокус на сегодня", callback_data="focus:today")],
+            [InlineKeyboardButton("Как задать 3 задачи", callback_data="focus:set_help")],
+        ],
+        "finance": [
+            [InlineKeyboardButton("Статус бюджета", callback_data="finance:status")],
+            [InlineKeyboardButton("Последние траты", callback_data="finance:last")],
+        ],
+        "content": [
+            [InlineKeyboardButton("Список идей", callback_data="content:ideas")],
+            [InlineKeyboardButton("Список черновиков", callback_data="content:drafts")],
+        ],
+        "inbox": [
+            [InlineKeyboardButton("Показать inbox", callback_data="inbox:list")],
+        ],
+    }
+    return InlineKeyboardMarkup(mapping[section])
 
 
 def _month_bounds(now: datetime) -> tuple[int, int]:
@@ -47,11 +91,153 @@ def _focus_day_key(tz_name: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Планировщик запущен.\n\n" + HELP_TEXT)
+    await update.message.reply_text("Планировщик запущен.\n\n" + HELP_TEXT, reply_markup=_main_menu())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, reply_markup=_main_menu())
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Главное меню:", reply_markup=_main_menu())
+
+
+async def menu_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+
+    if text == "🛒 Покупки":
+        await update.message.reply_text(
+            "Раздел Покупки.\nКоманды: /wish add <вещь> | <бюджет>, /wish list",
+            reply_markup=_section_actions("wish"),
+        )
+        return
+    if text == "🎯 Фокус":
+        await update.message.reply_text(
+            "Раздел Фокус.\nКоманды: /focus set задача1 ; задача2 ; задача3, /focus today",
+            reply_markup=_section_actions("focus"),
+        )
+        return
+    if text == "💸 Финансы":
+        await update.message.reply_text(
+            "Раздел Финансы.\nКоманды: /spent, /budget status, /spent_list",
+            reply_markup=_section_actions("finance"),
+        )
+        return
+    if text == "✍️ Контент":
+        await update.message.reply_text(
+            "Раздел Контент.\nКоманды: /idea ... и /draft ...",
+            reply_markup=_section_actions("content"),
+        )
+        return
+    if text == "📥 Inbox":
+        await update.message.reply_text(
+            "Раздел Inbox.\nЛюбой обычный текст сохраняется как заметка.",
+            reply_markup=_section_actions("inbox"),
+        )
+        return
+    if text == "ℹ️ Помощь":
+        await update.message.reply_text(HELP_TEXT, reply_markup=_main_menu())
+        return
+
+
+async def section_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    store: Store = context.bot_data["store"]
+    chat_id = query.message.chat_id
+    tz_name: str = context.bot_data["timezone"]
+
+    data = query.data
+    if data == "wish:list":
+        wishes = store.list_wishes(chat_id)
+        if not wishes:
+            await query.message.reply_text("Wishlist пуст.")
+            return
+        lines = ["Wishlist:"]
+        for w in wishes[:30]:
+            budget = f"до {w.budget} ₽" if w.budget else "без бюджета"
+            lines.append(f"• {w.id}: {w.item} ({budget})")
+        await query.message.reply_text("\n".join(lines))
+        return
+    if data == "wish:add_help":
+        await query.message.reply_text("Пример: /wish add PlayStation 5 | 39000")
+        return
+
+    if data == "focus:today":
+        day_key = _focus_day_key(tz_name)
+        row = store.get_focus_day(chat_id, day_key)
+        if not row:
+            await query.message.reply_text("Фокус дня еще не задан. Используй: /focus set ...")
+            return
+        lines = [f"Фокус на {day_key}:"]
+        for i in (1, 2, 3):
+            mark = "✅" if row[f"done{i}"] else "•"
+            lines.append(f"{mark} {i}. {row[f'item{i}']}")
+        await query.message.reply_text("\n".join(lines))
+        return
+    if data == "focus:set_help":
+        await query.message.reply_text("Пример: /focus set Продажи ; Контент ; Спорт")
+        return
+
+    if data == "finance:status":
+        now = datetime.now(ZoneInfo(tz_name))
+        start_ts, end_ts = _month_bounds(now)
+        total = store.spent_total_for_month(chat_id, start_ts, end_ts)
+        limit_raw = store.get_setting(chat_id, "monthly_budget")
+        if limit_raw and limit_raw.isdigit():
+            limit = int(limit_raw)
+            await query.message.reply_text(f"За месяц: {total} ₽ / {limit} ₽. Осталось: {limit - total} ₽")
+        else:
+            await query.message.reply_text(f"За месяц потрачено: {total} ₽. Лимит не задан.")
+        return
+    if data == "finance:last":
+        rows = store.list_spent(chat_id, 10)
+        if not rows:
+            await query.message.reply_text("Трат пока нет.")
+            return
+        lines = ["Последние траты:"]
+        for r in rows:
+            note = f" - {r.note}" if r.note else ""
+            lines.append(f"• {r.id}: {r.amount} ₽ [{r.category}]{note}")
+        await query.message.reply_text("\n".join(lines))
+        return
+
+    if data == "content:ideas":
+        rows = store.list_content(chat_id, kind="idea", include_done=False)
+        if not rows:
+            await query.message.reply_text("Идей пока нет.")
+            return
+        lines = ["Идеи:"]
+        for r in rows[:20]:
+            lines.append(f"• {r.id}: {r.title}")
+        await query.message.reply_text("\n".join(lines))
+        return
+    if data == "content:drafts":
+        rows = store.list_content(chat_id, kind="draft", include_done=False)
+        if not rows:
+            await query.message.reply_text("Черновиков пока нет.")
+            return
+        lines = ["Черновики:"]
+        for r in rows[:20]:
+            lines.append(f"• {r.id}: {r.title}")
+        await query.message.reply_text("\n".join(lines))
+        return
+
+    if data == "inbox:list":
+        tasks = store.list_tasks(chat_id, include_done=False)
+        if not tasks:
+            await query.message.reply_text("Inbox пуст.")
+            return
+        lines = ["Inbox:"]
+        for t in tasks[:30]:
+            lines.append(f"• {t.id}: {t.text}")
+        await query.message.reply_text("\n".join(lines))
+        return
 
 
 # Inbox
@@ -60,6 +246,8 @@ async def add_task_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     text = update.message.text.strip()
     if text.startswith("/"):
+        return
+    if text in MENU_BUTTONS:
         return
     store: Store = context.bot_data["store"]
     task_id = store.add_task(update.effective_chat.id, text)
@@ -439,6 +627,7 @@ def build_app(token: str, db_path: str, tz_name: str) -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
 
     app.add_handler(CommandHandler("wish", wish_cmd))
@@ -451,6 +640,8 @@ def build_app(token: str, db_path: str, tz_name: str) -> Application:
     app.add_handler(CommandHandler("idea", idea_cmd))
     app.add_handler(CommandHandler("draft", draft_cmd))
 
+    app.add_handler(CallbackQueryHandler(section_callback))
+    app.add_handler(MessageHandler(filters.Regex(r"^(🛒 Покупки|🎯 Фокус|💸 Финансы|✍️ Контент|📥 Inbox|ℹ️ Помощь)$"), menu_buttons_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_from_text))
 
     async def _on_start(app_: Application) -> None:
